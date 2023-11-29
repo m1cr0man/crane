@@ -3,6 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
 
     crane = {
       url = "github:ipetkov/crane";
@@ -15,8 +16,6 @@
       inputs.rust-analyzer-src.follows = "";
     };
 
-    flake-utils.url = "github:numtide/flake-utils";
-
     advisory-db = {
       url = "github:rustsec/advisory-db";
       flake = false;
@@ -26,16 +25,48 @@
   outputs = { self, nixpkgs, crane, fenix, flake-utils, advisory-db, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
+        pkgs = import nixpkgs {
+          inherit system;
+        };
+
+        stdenv =
+          if pkgs.stdenv.isLinux then
+            pkgs.stdenvAdapters.useMoldLinker pkgs.stdenv
+          else
+            pkgs.stdenv;
 
         inherit (pkgs) lib;
 
-        craneLib = crane.lib.${system};
+        craneLib = crane.mkLib pkgs;
         src = craneLib.cleanCargoSource (craneLib.path ./.);
+
+        mkToolchain = fenix.packages.${system}.combine;
+
+        toolchain = fenix.packages.${system}.stable;
+
+        buildToolchain = mkToolchain (with toolchain; [
+          cargo
+          rustc
+        ]);
+
+        craneLibBuild = craneLib.overrideToolchain buildToolchain;
+
+        devToolchain = mkToolchain (with toolchain; [
+          cargo
+          clippy
+          rust-src
+          rustc
+          llvm-tools
+
+          # Always use nightly rustfmt because most of its options are unstable
+          fenix.packages.${system}.latest.rustfmt
+        ]);
+
+        craneLibDev = craneLib.overrideToolchain devToolchain;
 
         # Common arguments can be set here to avoid repeating them later
         commonArgs = {
-          inherit src;
+          inherit src stdenv;
           strictDeps = true;
 
           buildInputs = [
@@ -49,20 +80,13 @@
           # MY_CUSTOM_VAR = "some value";
         };
 
-        craneLibLLvmTools = craneLib.overrideToolchain
-          (fenix.packages.${system}.complete.withComponents [
-            "cargo"
-            "llvm-tools"
-            "rustc"
-          ]);
-
         # Build *just* the cargo dependencies, so we can reuse
         # all of that work (e.g. via cachix) when running in CI
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        cargoArtifacts = craneLibBuild.buildDepsOnly commonArgs;
 
         # Build the actual crate itself, reusing the dependency
         # artifacts from above.
-        my-crate = craneLib.buildPackage (commonArgs // {
+        my-crate = craneLibBuild.buildPackage (commonArgs // {
           inherit cargoArtifacts;
         });
       in
@@ -77,34 +101,34 @@
           # Note that this is done as a separate derivation so that
           # we can block the CI if there are issues here, but not
           # prevent downstream consumers from building our crate by itself.
-          my-crate-clippy = craneLib.cargoClippy (commonArgs // {
+          my-crate-clippy = craneLibDev.cargoClippy (commonArgs // {
             inherit cargoArtifacts;
             cargoClippyExtraArgs = "--all-targets -- --deny warnings";
           });
 
-          my-crate-doc = craneLib.cargoDoc (commonArgs // {
+          my-crate-doc = craneLibDev.cargoDoc (commonArgs // {
             inherit cargoArtifacts;
           });
 
           # Check formatting
-          my-crate-fmt = craneLib.cargoFmt {
+          my-crate-fmt = craneLibDev.cargoFmt {
             inherit src;
           };
 
           # Audit dependencies
-          my-crate-audit = craneLib.cargoAudit {
+          my-crate-audit = craneLibDev.cargoAudit {
             inherit src advisory-db;
           };
 
           # Audit licenses
-          my-crate-deny = craneLib.cargoDeny {
+          my-crate-deny = craneLibDev.cargoDeny {
             inherit src;
           };
 
           # Run tests with cargo-nextest
           # Consider setting `doCheck = false` on `my-crate` if you do not want
           # the tests to run twice
-          my-crate-nextest = craneLib.cargoNextest (commonArgs // {
+          my-crate-nextest = craneLibDev.cargoNextest (commonArgs // {
             inherit cargoArtifacts;
             partitions = 1;
             partitionType = "count";
@@ -113,7 +137,7 @@
 
         packages = {
           default = my-crate;
-          my-crate-llvm-coverage = craneLibLLvmTools.cargoLlvmCov (commonArgs // {
+          my-crate-llvm-coverage = craneLibDev.cargoLlvmCov (commonArgs // {
             inherit cargoArtifacts;
           });
         };
@@ -122,17 +146,19 @@
           drv = my-crate;
         };
 
-        devShells.default = craneLib.devShell {
+        devShells.default = craneLibDev.devShell {
           # Inherit inputs from checks.
           checks = self.checks.${system};
 
           # Additional dev-shell environment variables can be set directly
           # MY_CUSTOM_DEVELOPMENT_VAR = "something else";
+          RUST_SRC_PATH = "${devToolchain}/lib/rustlib/src/rust/library";
 
           # Extra inputs can be added here; cargo and rustc are provided by default.
           packages = [
             # pkgs.ripgrep
           ];
         };
-      });
+      }
+    );
 }
